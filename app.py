@@ -1,6 +1,12 @@
 import os
 import streamlit as st
-from dotenv import load_dotenv
+
+# 1. Safe dotenv import (Prevents ModuleNotFoundError on Streamlit Cloud)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 from zero_key_agent import (
     get_video_keywords_from_prompt,
@@ -8,9 +14,16 @@ from zero_key_agent import (
     assemble_video
 )
 
-# Load environment configuration
-load_dotenv()
-PIXABAY_KEY = os.getenv("PIXABAY_KEY")
+# 2. Fetch PIXABAY_KEY (Prioritizes Streamlit Cloud Secrets, falls back to .env)
+PIXABAY_KEY = None
+try:
+    if "PIXABAY_KEY" in st.secrets:
+        PIXABAY_KEY = st.secrets["PIXABAY_KEY"]
+except Exception:
+    pass
+
+if not PIXABAY_KEY:
+    PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 
 # --- Page Setup ---
 st.set_page_config(
@@ -172,10 +185,10 @@ st.markdown(f"""
 
 # API Key Validation
 if not PIXABAY_KEY:
-    st.error("PIXABAY_KEY not found. Add `PIXABAY_KEY=your_key` to your `.env` file and restart the app.")
+    st.error("PIXABAY_KEY not found. Add it to your `.env` file locally or in Streamlit Cloud Secrets (Settings -> Secrets).")
     st.stop()
 
-# --- Prompt state (so the quick-idea buttons actually fill the text box) ---
+# --- Prompt state ---
 DEFAULT_PROMPT = (
     "Cinematic exploration of artificial intelligence: glowing quantum processors, "
     "neural networks visualized in 3D, autonomous robotics, futuristic human-AI "
@@ -184,10 +197,8 @@ DEFAULT_PROMPT = (
 if "prompt" not in st.session_state:
     st.session_state.prompt = DEFAULT_PROMPT
 
-
 def set_prompt(text: str):
     st.session_state.prompt = text
-
 
 PRESETS = {
     "Deep Space": "Futuristic spacecraft navigating an asteroid field, entering warp speed, glowing alien nebula, docking at massive orbital station.",
@@ -253,9 +264,9 @@ with col_monitor:
         """, unsafe_allow_html=True)
         storyboard_placeholder = st.empty()
 
-# --- Generation ---
+# --- Generation Execution ---
 if generate_btn:
-    output_filename = "cinematic_studio_render.mp4"
+    output_filename = "reelkatha_render.mp4"
 
     with col_monitor:
         status_box = st.status("Rendering your video...", expanded=True)
@@ -271,9 +282,12 @@ if generate_btn:
                 badges = "".join([f'<span class="scene-badge">{kw}</span>' for kw in keywords])
                 st.markdown(badges, unsafe_allow_html=True)
 
-            # 2. Footage download
-            status_box.write("**Step 2 of 3:** Downloading HD footage from Pixabay...")
-            clips = download_real_videos(keywords, aspect_ratio=selected_ratio)
+            # 2. Footage download (Safely handles aspect_ratio param)
+            status_box.write("**Step 2 of 3:** Downloading footage from Pixabay...")
+            try:
+                clips = download_real_videos(keywords, aspect_ratio=selected_ratio)
+            except TypeError:
+                clips = download_real_videos(keywords)
 
             if not clips:
                 status_box.update(label="No clips found. Try a different prompt.", state="error")
@@ -281,7 +295,7 @@ if generate_btn:
             status_box.write(f"Downloaded {len(clips)} clips.")
 
             # 3. Assemble
-            status_box.write(f"**Step 3 of 3:** Cropping to {selected_ratio} and building the MP4...")
+            status_box.write(f"**Step 3 of 3:** Cropping to {selected_ratio} and compiling MP4...")
             success = assemble_video(clips, total_duration, output_filename, aspect_ratio=selected_ratio)
 
             if success:
