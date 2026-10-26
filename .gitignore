@@ -1,0 +1,10 @@
+.venv/
+**/.venv/
+__pycache__/
+*.py[cod]
+.env
+**/.env
+temp_images/
+temp_videos/
+output_reel*.mp4
+temp_voice.mp3
