@@ -1,20 +1,14 @@
 """
-zero_key_agent.py  (v2)
+zero_key_agent.py (v2 - Cloud & Local Hybrid)
 
 Backend for the video studio app:
   1. get_video_keywords_from_prompt()  - story -> list of stock-footage search queries
   2. download_real_videos()            - smart Pixabay search + cached, parallel downloads
   3. assemble_video()                  - crop/fit, crossfade, fades, optional music -> MP4
 
-Optional .env settings for AI-written scenes (any OpenAI-compatible provider):
-    LLM_API_KEY=your_key
-    LLM_BASE_URL=https://api.groq.com/openai/v1      # default; change for another provider
-    LLM_MODEL=llama-3.3-70b-versatile                # check your provider for current model names
-Without LLM_API_KEY the app tries a keyless endpoint, then falls back to a built-in keyword builder.
-
-All function names and the first arguments are the same as before, so the old
-app.py keeps working. Every new feature is an optional keyword argument.
+Supports both Streamlit Cloud Secrets (st.secrets) and local .env files.
 """
+
 import os
 import re
 import json
@@ -27,18 +21,30 @@ from typing import Callable, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from dotenv import load_dotenv
-from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips, vfx, afx
 
-# --- 1. CONFIGURATION ---
-load_dotenv()
+# --- 1. SAFE CONFIGURATION & SECRET MANAGEMENT ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-ProgressCb = Optional[Callable[[float, str], None]]  # (0.0 - 1.0, message)
+# Helper to read from Streamlit Secrets first, then OS environment variables
+def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return os.getenv(key, default)
 
 
 def _pixabay_key() -> Optional[str]:
-    # Read at call time so a changed .env / environment is picked up.
-    return os.getenv("PIXABAY_KEY")
+    return _get_secret("PIXABAY_KEY")
+
+
+ProgressCb = Optional[Callable[[float, str], None]]  # (0.0 - 1.0, message)
 
 
 def _make_session() -> requests.Session:
@@ -64,7 +70,7 @@ def _report(cb: ProgressCb, fraction: float, message: str) -> None:
         try:
             cb(max(0.0, min(1.0, fraction)), message)
         except Exception:
-            pass  # a broken UI callback must never break rendering
+            pass
 
 
 # =====================================================================
@@ -78,15 +84,15 @@ _STOPWORDS = {
 
 
 def _clean_keyword(kw) -> str:
-    """Normalise one search query: plain lowercase text, max 3 words."""
-    if isinstance(kw, dict):  # some models return [{"scene": "..."}]
+    """Normalize one search query: plain lowercase text, max 3 words."""
+    if isinstance(kw, dict):
         kw = next((v for v in kw.values() if isinstance(v, str)), "")
     kw = re.sub(r"[^a-zA-Z0-9\s\-]", " ", str(kw)).lower()
     return " ".join(kw.split()[:3])
 
 
 def _parse_keyword_list(text: str) -> List[str]:
-    """Pull a JSON array out of a messy LLM reply; fall back to line parsing."""
+    """Extract a clean list of search queries from messy LLM responses."""
     start, end = text.find("["), text.rfind("]") + 1
     if start != -1 and end > start:
         try:
@@ -104,7 +110,6 @@ _ABSTRACT = {
     "concept", "idea", "style", "mood", "feeling", "beautiful", "amazing", "epic",
 }
 
-# Extra concrete scene ideas per style, used when the prompt has fewer phrases than scenes.
 _STYLE_EXTRAS = {
     "drone": ["aerial landscape", "mountain drone", "ocean coast aerial", "forest aerial", "city aerial", "sunset clouds"],
     "cyberpunk": ["neon city night", "rain street neon", "futuristic city", "digital code", "robot technology", "hologram light"],
@@ -115,10 +120,7 @@ _STYLE_EXTRAS = {
 
 
 def _fallback_keywords(prompt: str, style: str, count: int) -> List[str]:
-    """
-    No-LLM keyword builder. Uses the prompt's own comma/period separated phrases first,
-    then fills any remaining scenes with concrete ideas that match the chosen style.
-    """
+    """No-LLM fallback: parses prompt phrases and mixes in style anchors."""
     out: List[str] = []
     for p in re.split(r"[,.;:\n]", prompt):
         words = [w for w in re.findall(r"[a-zA-Z]+", p.lower())
@@ -141,35 +143,33 @@ def _fallback_keywords(prompt: str, style: str, count: int) -> List[str]:
 
 
 _PERMANENT_ERRORS = (401, 402, 403, 404)
-_keyless_llm_dead = False   # set once the free endpoint rejects us, so we stop wasting time
+_keyless_llm_dead = False
 
 
 def _ask_llm(instruction: str) -> str:
-    """
-    1) If LLM_API_KEY is set -> any OpenAI-compatible API (Groq, Gemini, OpenRouter, OpenAI...).
-    2) Otherwise -> the keyless Pollinations endpoint (may be paid/blocked).
-    """
+    """1) Use custom OpenAI/Groq API if configured; 2) Otherwise fallback to Pollinations."""
     global _keyless_llm_dead
-    api_key = os.getenv("LLM_API_KEY")
+    api_key = _get_secret("LLM_API_KEY")
+    
     if api_key:
-        base = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-        model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+        base = _get_secret("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+        model = _get_secret("LLM_MODEL", "llama-3.3-70b-versatile")
         r = SESSION.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": model, "temperature": 0.7,
                   "messages": [{"role": "user", "content": instruction}]},
-            timeout=40,
+            timeout=35,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
     if _keyless_llm_dead:
         raise RuntimeError("keyless LLM unavailable")
-    url = ("https://text.pollinations.ai/"
-           f"{urllib.parse.quote(instruction)}?seed={random.randint(1, 10**6)}")
+
+    url = f"https://text.pollinations.ai/{urllib.parse.quote(instruction)}?seed={random.randint(1, 10**6)}"
     try:
-        r = SESSION.get(url, timeout=30)
+        r = SESSION.get(url, timeout=25)
         r.raise_for_status()
         return r.text
     except requests.HTTPError as e:
@@ -180,10 +180,7 @@ def _ask_llm(instruction: str) -> str:
 
 def get_video_keywords_from_prompt(prompt: str, style: str = "Cinematic", count: int = 12,
                                    retries: int = 3) -> List[str]:
-    """
-    Turn a story + style into exactly `count` stock-footage search queries.
-    Uses an LLM when available, otherwise the built-in keyword builder.
-    """
+    """Turn story and style into exact stock video search queries."""
     instruction = (
         "You are a professional film director and video editor. "
         f"The user wants a video based on this prompt: '{prompt}'. "
@@ -206,21 +203,18 @@ def get_video_keywords_from_prompt(prompt: str, style: str = "Cinematic", count:
                 break
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
-            print(f"AI scene planner returned HTTP {code}.")
             if code in _PERMANENT_ERRORS:
-                break          # retrying a 401/402/403/404 can never succeed
+                break
         except RuntimeError:
-            break              # keyless endpoint already known to be unavailable
-        except Exception as e:
-            print(f"Keyword attempt {attempt + 1}/{retries} failed: {e}")
+            break
+        except Exception:
+            pass
 
     if not keywords:
-        print("Using the built-in keyword builder. For AI-written scenes, add LLM_API_KEY to .env "
-              "(see the comments at the top of zero_key_agent.py).")
         return _fallback_keywords(prompt, style, count)
 
-    # Exactly `count` items: cycle if the model returned too few, trim if too many.
     return [keywords[i % len(keywords)] for i in range(count)]
+
 
 # =====================================================================
 # 3. PIXABAY SEARCH + DOWNLOAD
@@ -228,25 +222,25 @@ def get_video_keywords_from_prompt(prompt: str, style: str = "Cinematic", count:
 def _search_pixabay(query: str, per_page: int = 20) -> list:
     key = _pixabay_key()
     if not key:
-        raise RuntimeError("PIXABAY_KEY is missing. Add it to your .env file.")
+        raise RuntimeError("PIXABAY_KEY is missing. Add it to .env or Streamlit Secrets.")
     try:
         r = SESSION.get(
             "https://pixabay.com/api/videos/",
             params={"key": key, "q": query, "video_type": "film",
                     "per_page": per_page, "safesearch": "true"},
-            timeout=20,
+            timeout=15,
         )
         r.raise_for_status()
         return r.json().get("hits", [])
     except Exception as e:
-        print(f"Pixabay search failed for '{query}': {e}")
+        print(f"Pixabay search error for '{query}': {e}")
         return []
 
 
 def _best_rendition(hit: dict, prefer: str) -> Optional[Tuple[str, dict]]:
-    """Choose the highest available quality, starting from `prefer`."""
-    order = ["large", "medium", "small", "tiny"]
-    order = order[order.index(prefer):] if prefer in order else order
+    order = ["medium", "small", "large", "tiny"]
+    if prefer in order:
+        order = order[order.index(prefer):]
     vids = hit.get("videos", {})
     for q in order:
         v = vids.get(q) or {}
@@ -256,7 +250,6 @@ def _best_rendition(hit: dict, prefer: str) -> Optional[Tuple[str, dict]]:
 
 
 def _score_hit(hit: dict, portrait: Optional[bool], prefer: str) -> Optional[Tuple[float, str, dict]]:
-    """Higher score = better clip for this project."""
     rend = _best_rendition(hit, prefer)
     if not rend:
         return None
@@ -265,17 +258,16 @@ def _score_hit(hit: dict, portrait: Optional[bool], prefer: str) -> Optional[Tup
     score = 0.0
     if w and h:
         if portrait is not None and (h > w) == portrait:
-            score += 50                      # orientation matches the output -> less cropping
-        score += min(max(w, h), 1920) / 1920 * 30   # resolution
+            score += 50
+        score += min(max(w, h), 1920) / 1920 * 30
     dur = hit.get("duration", 0) or 0
-    score += min(dur, 15)                    # longer clips cut better
+    score += min(dur, 15)
     if dur < 3:
-        score -= 20                          # too short to use
+        score -= 20
     return score, quality, v
 
 
 def _queries_for(kw: str) -> List[str]:
-    """Search chain: full phrase -> last word -> first word."""
     words = kw.split()
     chain = [kw]
     if len(words) > 1:
@@ -285,13 +277,12 @@ def _queries_for(kw: str) -> List[str]:
 
 
 def _download_file(url: str, dest: str) -> bool:
-    """Download to a .part file then rename, so a half-finished file is never reused."""
     tmp = dest + ".part"
     try:
-        with SESSION.get(url, stream=True, timeout=60) as r:
+        with SESSION.get(url, stream=True, timeout=40) as r:
             r.raise_for_status()
             with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                for chunk in r.iter_content(chunk_size=1024 * 512):
                     f.write(chunk)
         os.replace(tmp, dest)
         return True
@@ -304,23 +295,20 @@ def _download_file(url: str, dest: str) -> bool:
 
 def download_real_videos(keywords, folder: str = "temp_videos",
                          aspect_ratio: Optional[str] = None,
-                         quality: str = "large",
-                         max_workers: int = 4,
+                         quality: str = "medium",
+                         max_workers: int = 5,
                          progress_callback: ProgressCb = None) -> List[str]:
     """
-    For each keyword: search Pixabay, pick the best UNUSED clip, download in parallel.
-
-    aspect_ratio: "9:16" or "16:9" - prefers clips that already match the shape.
-    Downloads are cached by Pixabay video id, so re-rendering costs almost nothing.
-    Returns file paths in scene order (scenes with no footage are skipped).
+    Search Pixabay, pick optimal non-duplicate clips, and download concurrently.
+    Cached by Pixabay video ID to make re-runs instantaneous.
     """
     os.makedirs(folder, exist_ok=True)
     portrait = None if aspect_ratio is None else (aspect_ratio == "9:16")
     total = max(len(keywords), 1)
 
-    # Step A: choose a clip for every scene (sequential: cheap, and needs de-duplication)
     used_ids = set()
-    plan: List[Tuple[int, str, str]] = []   # (scene index, url, cache path)
+    plan: List[Tuple[int, str, str]] = []
+    
     for i, kw in enumerate(keywords):
         chosen = None
         for q in _queries_for(kw):
@@ -341,11 +329,8 @@ def download_real_videos(keywords, folder: str = "temp_videos",
                 break
         if chosen:
             plan.append(chosen)
-        else:
-            print(f"No footage found for scene {i + 1}: '{kw}'")
-        _report(progress_callback, 0.3 * (i + 1) / total, f"Searched {i + 1}/{total} scenes")
+        _report(progress_callback, 0.3 * (i + 1) / total, f"Searching scenes ({i + 1}/{total})")
 
-    # Step B: download everything in parallel (skip files already cached)
     done_count = 0
 
     def fetch(item: Tuple[int, str, str]) -> Tuple[int, Optional[str]]:
@@ -367,10 +352,10 @@ def download_real_videos(keywords, folder: str = "temp_videos",
 
 
 # =====================================================================
-# 4. VIDEO ASSEMBLY
+# 4. VIDEO ASSEMBLY (Speed-Optimized for Cloud & Desktop)
 # =====================================================================
 def _fit_to_frame(clip, w: int, h: int):
-    """Scale to fully cover the frame, then center-crop (no black bars, no stretching)."""
+    """Scale to cover frame, then center crop (no letterbox bars, no distortion)."""
     scale = max(w / clip.w, h / clip.h)
     new_w, new_h = max(w, math.ceil(clip.w * scale)), max(h, math.ceil(clip.h * scale))
     clip = clip.resized((new_w, new_h))
@@ -378,27 +363,27 @@ def _fit_to_frame(clip, w: int, h: int):
 
 
 def assemble_video(video_files, total_duration, output_path, aspect_ratio: str = "9:16",
-                   crossfade: float = 0.4,
-                   fps: int = 30,
+                   crossfade: float = 0.3,
+                   fps: int = 24,
                    music_path: Optional[str] = None,
                    music_volume: float = 0.5,
-                   fade_in: float = 0.5,
-                   fade_out: float = 0.8,
+                   fade_in: float = 0.4,
+                   fade_out: float = 0.6,
+                   preset: str = "ultrafast",
                    progress_callback: ProgressCb = None) -> bool:
     """
-    Build the final MP4.
-
-    crossfade   : seconds of dissolve between scenes (0 = hard cuts). Total length
-                  still equals `total_duration`.
-    music_path  : optional audio file; looped/trimmed to fit, faded out at the end.
+    Concatenate, crop, apply crossfades and export final MP4.
+    preset='ultrafast' ensures fast rendering on Streamlit Cloud containers.
     """
+    from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips, vfx, afx
+
     n = len(video_files)
     if n == 0:
         return False
 
-    target_w, target_h = (1920, 1080) if aspect_ratio == "16:9" else (1080, 1920)
+    # Standard clean resolutions (720p vertical saves massive CPU overhead)
+    target_w, target_h = (1280, 720) if aspect_ratio == "16:9" else (720, 1280)
 
-    # Overlapping scenes shorten the timeline, so make each scene a little longer.
     base = total_duration / n
     t = max(0.0, min(crossfade, base / 3)) if n > 1 else 0.0
     per_clip = (total_duration + t * (n - 1)) / n
@@ -420,7 +405,7 @@ def assemble_video(video_files, total_duration, output_path, aspect_ratio: str =
             if i > 0 and t > 0:
                 clip = clip.with_effects([vfx.CrossFadeIn(t)])
             processed.append(clip)
-            _report(progress_callback, 0.4 * (i + 1) / n, f"Prepared scene {i + 1}/{n}")
+            _report(progress_callback, 0.4 * (i + 1) / n, f"Processing scene {i + 1}/{n}")
 
         final = concatenate_videoclips(processed, method="compose", padding=-t if t > 0 else 0)
         final = final.subclipped(0, min(final.duration, total_duration))
@@ -439,24 +424,22 @@ def assemble_video(video_files, total_duration, output_path, aspect_ratio: str =
                 audio = audio.with_effects([afx.AudioLoop(duration=final.duration)])
             else:
                 audio = audio.subclipped(0, final.duration)
-            audio = audio.with_effects([afx.MultiplyVolume(music_volume), afx.AudioFadeOut(1.5)])
+            audio = audio.with_effects([afx.MultiplyVolume(music_volume), afx.AudioFadeOut(1.2)])
             final = final.with_audio(audio)
 
-        _report(progress_callback, 0.5, "Encoding video...")
+        _report(progress_callback, 0.5, "Encoding video file...")
         final.write_videofile(
             output_path,
             fps=fps,
             codec="libx264",
-            audio_codec="aac",
-            preset="medium",
+            audio_codec="aac" if audio else None,
+            preset=preset,
             threads=os.cpu_count() or 4,
-            # yuv420p + faststart = plays in every browser / phone / social app
             ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         )
-        _report(progress_callback, 1.0, "Done")
+        _report(progress_callback, 1.0, "Ready")
         return True
     finally:
-        # Always release file handles, even if encoding failed.
         for c in [final, audio, *processed, *opened]:
             try:
                 if c is not None:
